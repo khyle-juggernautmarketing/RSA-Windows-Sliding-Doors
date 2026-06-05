@@ -3,11 +3,11 @@
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import {
   Calendar,
+  CalendarClock,
   CheckCircle2,
   ClipboardList,
   Loader2,
   Mail,
-  Hash,
   MapPin,
   MessageSquare,
   Phone,
@@ -15,7 +15,9 @@ import {
   User,
 } from 'lucide-react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { AppointmentCalendar } from '@/components/AppointmentCalendar'
 import {
   INFORMATIONAL_SMS_CONSENT,
   MARKETING_SMS_CONSENT,
@@ -24,16 +26,18 @@ import {
 } from '@/lib/constants'
 import { SERVICE_OPTIONS, TIMELINE_OPTIONS } from '@/lib/formOptions'
 import { getFormLoadedAt, getLeadFetchHeaders } from '@/lib/leadClient'
+import { FORM_TIMEOUT_MS } from '@/lib/scheduling'
 
 const STEPS = [
   { id: 1, title: 'What service do you need?' },
   { id: 2, title: 'Select Your Project Timeline' },
   { id: 3, title: 'Your contact details' },
+  { id: 4, title: 'Schedule your free assessment' },
 ]
 
 const HTML_TAG = /<[^>]*>/g
 
-const STEP_ICONS = [ClipboardList, Calendar, User]
+const STEP_ICONS = [ClipboardList, Calendar, User, CalendarClock]
 
 const initialForm = {
   service: '',
@@ -42,7 +46,6 @@ const initialForm = {
   email: '',
   phone: '',
   address: '',
-  zip: '',
   marketingSmsConsent: false,
   informationalSmsConsent: false,
 }
@@ -58,6 +61,9 @@ function parseApiError(body, status) {
   }
   if (status === 429) {
     return `Too many requests. Please wait a few minutes or call ${PHONE_PRIMARY}.`
+  }
+  if (status === 409) {
+    return 'That time was just booked. Please choose another slot.'
   }
   if (status >= 500) {
     return `Our booking system is temporarily unavailable. Please call ${PHONE_PRIMARY}.`
@@ -76,8 +82,8 @@ function useStepAdvanceDelay() {
   return ms
 }
 
-function ProgressBar({ step }) {
-  const pct = (step / STEPS.length) * 100
+function ProgressBar({ step, total }) {
+  const pct = (step / total) * 100
   return (
     <div className="mb-5 h-1.5 w-full overflow-hidden rounded-full bg-stone-200" aria-hidden>
       <div
@@ -141,24 +147,8 @@ function IconField({ icon: Icon, label, children }) {
 const fieldClass =
   'min-h-12 w-full rounded-xl border border-stone-200 bg-white py-3 pl-[3.25rem] pr-4 text-base text-stone-900 placeholder:text-stone-400 focus:border-amber-600 focus:outline-none focus:ring-2 focus:ring-amber-600/20 sm:text-sm'
 
-function SuccessMarks() {
-  return (
-    <svg className="h-28 w-28 text-amber-600" viewBox="0 0 64 64" aria-hidden>
-      <circle cx="32" cy="32" r="28" fill="rgba(217,119,6,0.15)" />
-      <path
-        className="animate-check-stroke"
-        stroke="currentColor"
-        strokeWidth="3.5"
-        fill="none"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        d="M18 34l8 8 20-22"
-      />
-    </svg>
-  )
-}
-
 export function LeadForm() {
+  const router = useRouter()
   const prefersReducedMotion = useReducedMotion()
   const [step, setStep] = useState(1)
   const [data, setData] = useState(initialForm)
@@ -166,14 +156,164 @@ export function LeadForm() {
   const [errorMsg, setErrorMsg] = useState('')
   const [honeypot, setHoneypot] = useState('')
   const [companyHoneypot, setCompanyHoneypot] = useState('')
+  const [selectedSlotMs, setSelectedSlotMs] = useState(null)
+  const [timeoutSecs, setTimeoutSecs] = useState(null)
   const formLoadedAtRef = useRef(getFormLoadedAt())
+  const calendarStartedAtRef = useRef(null)
+  const timeoutSentRef = useRef(false)
+  const pendingPayloadRef = useRef(null)
   const stepAdvanceDelayMs = useStepAdvanceDelay()
 
-  useEffect(() => {
-    if (process.env.NODE_ENV === 'development') {
-      console.debug('[LeadForm] step:', step, 'status:', status)
+  const buildValidatedPayload = useCallback(() => {
+    const name = sanitizeInput(data.name.trim())
+    const email = sanitizeInput(data.email.trim())
+    const phone = sanitizeInput(data.phone.trim())
+    const address = sanitizeInput(data.address.trim())
+
+    return {
+      service: data.service,
+      timeline: data.timeline,
+      name,
+      email,
+      phone,
+      address,
+      marketingSmsConsent: data.marketingSmsConsent,
+      informationalSmsConsent: data.informationalSmsConsent,
+      source: 'rsa-windows-landing',
+      submittedAt: new Date().toISOString(),
+      formLoadedAt: formLoadedAtRef.current ?? getFormLoadedAt(),
     }
-  }, [step, status])
+  }, [data])
+
+  const validateContactStep = useCallback(() => {
+    if (!data.service) {
+      setErrorMsg('Please select a service.')
+      setStep(1)
+      return null
+    }
+    if (!data.timeline) {
+      setErrorMsg('Please select a timeline.')
+      setStep(2)
+      return null
+    }
+
+    const payload = buildValidatedPayload()
+    const { name, email, phone, address } = payload
+
+    if (!name || !email || !phone || !address) {
+      setErrorMsg('Please fill in all fields.')
+      return null
+    }
+    if (name.length < 2) {
+      setErrorMsg('Please enter your full name.')
+      return null
+    }
+    const phoneDigits = phone.replace(/\D/g, '')
+    if (phoneDigits.length < 10) {
+      setErrorMsg('Please enter a valid phone number.')
+      return null
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setErrorMsg('Please enter a valid email.')
+      return null
+    }
+    if (address.length < 8) {
+      setErrorMsg('Please enter your full property address.')
+      return null
+    }
+    if (!data.marketingSmsConsent) {
+      setErrorMsg('Please consent to marketing SMS messages to continue.')
+      return null
+    }
+    if (!data.informationalSmsConsent) {
+      setErrorMsg('Please consent to informational SMS messages to continue.')
+      return null
+    }
+
+    return payload
+  }, [buildValidatedPayload, data])
+
+  const submitToApi = useCallback(
+    async (payload, options = {}) => {
+      const { appointmentSkipped = false, appointmentAt = null } = options
+
+      setStatus('loading')
+      setErrorMsg('')
+
+      const body = {
+        ...payload,
+        appointmentSkipped,
+        appointmentAt: appointmentAt ? new Date(appointmentAt).toISOString() : null,
+        skipTimingCheck: true,
+      }
+
+      try {
+        const res = await fetch('/api/lead', {
+          method: 'POST',
+          headers: getLeadFetchHeaders(),
+          body: JSON.stringify(body),
+          cache: 'no-store',
+          credentials: 'same-origin',
+        })
+
+        let resBody = null
+        const raw = await res.text()
+        if (raw) {
+          try {
+            resBody = JSON.parse(raw)
+          } catch {
+            resBody = null
+          }
+        }
+
+        if (!res.ok) {
+          setStatus('idle')
+          setErrorMsg(parseApiError(resBody, res.status))
+          return false
+        }
+
+        const params = new URLSearchParams()
+        params.set('name', payload.name)
+        if (appointmentAt && !appointmentSkipped) {
+          params.set('appointment', new Date(appointmentAt).toISOString())
+        } else if (appointmentSkipped) {
+          params.set('skipped', '1')
+        }
+
+        router.push(`/thank-you?${params.toString()}`)
+        return true
+      } catch {
+        setStatus('idle')
+        setErrorMsg(`Network error. Please try again or call ${PHONE_PRIMARY}.`)
+        return false
+      }
+    },
+    [router],
+  )
+
+  const sendTimeoutFallback = useCallback(async () => {
+    if (timeoutSentRef.current || !pendingPayloadRef.current) return
+    timeoutSentRef.current = true
+    await submitToApi(pendingPayloadRef.current, { appointmentSkipped: true })
+  }, [submitToApi])
+
+  useEffect(() => {
+    if (step !== 4 || !calendarStartedAtRef.current) return
+
+    const tick = () => {
+      const elapsed = Date.now() - calendarStartedAtRef.current
+      const remaining = Math.max(0, FORM_TIMEOUT_MS - elapsed)
+      setTimeoutSecs(Math.ceil(remaining / 1000))
+
+      if (remaining <= 0 && !timeoutSentRef.current) {
+        sendTimeoutFallback()
+      }
+    }
+
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [step, sendTimeoutFallback])
 
   const selectService = useCallback(
     (service) => {
@@ -193,156 +333,36 @@ export function LeadForm() {
     [stepAdvanceDelayMs],
   )
 
-  const submit = async (e) => {
+  const continueToCalendar = (e) => {
     e.preventDefault()
     setErrorMsg('')
-
     if (honeypot || companyHoneypot) return
 
-    if (!data.service) {
-      setErrorMsg('Please select a service.')
-      setStep(1)
-      return
-    }
-    if (!data.timeline) {
-      setErrorMsg('Please select a timeline.')
-      setStep(2)
+    const payload = validateContactStep()
+    if (!payload) return
+
+    pendingPayloadRef.current = payload
+    calendarStartedAtRef.current = Date.now()
+    timeoutSentRef.current = false
+    setSelectedSlotMs(null)
+    setStep(4)
+  }
+
+  const confirmAppointment = async () => {
+    if (!pendingPayloadRef.current) return
+    if (!selectedSlotMs) {
+      setErrorMsg('Please select an appointment time.')
       return
     }
 
-    const name = sanitizeInput(data.name.trim())
-    const email = sanitizeInput(data.email.trim())
-    const phone = sanitizeInput(data.phone.trim())
-    const address = sanitizeInput(data.address.trim())
-    const zip = sanitizeInput(data.zip.trim())
-
-    if (!name || !email || !phone || !address || !zip) {
-      setErrorMsg('Please fill in all fields.')
-      return
-    }
-    if (name.length < 2) {
-      setErrorMsg('Please enter your full name.')
-      return
-    }
-    const phoneDigits = phone.replace(/\D/g, '')
-    if (phoneDigits.length < 10) {
-      setErrorMsg('Please enter a valid phone number.')
-      return
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      setErrorMsg('Please enter a valid email.')
-      return
-    }
-    if (address.length < 8) {
-      setErrorMsg('Please enter your full property address.')
-      return
-    }
-    if (!/^\d{5}(-\d{4})?$/.test(zip)) {
-      setErrorMsg('Please enter a valid ZIP code.')
-      return
-    }
-    if (!data.marketingSmsConsent) {
-      setErrorMsg('Please consent to marketing SMS messages to continue.')
-      return
-    }
-    if (!data.informationalSmsConsent) {
-      setErrorMsg('Please consent to informational SMS messages to continue.')
-      return
-    }
-
-    const payload = {
-      service: data.service,
-      timeline: data.timeline,
-      name,
-      email,
-      phone,
-      address,
-      zip,
-      marketingSmsConsent: data.marketingSmsConsent,
-      informationalSmsConsent: data.informationalSmsConsent,
-      source: 'rsa-windows-landing',
-      submittedAt: new Date().toISOString(),
-      formLoadedAt: formLoadedAtRef.current ?? getFormLoadedAt(),
-    }
-
-    if (process.env.NODE_ENV === 'development') {
-      console.debug('[LeadForm submit]', {
-        ...payload,
-        email: '[redacted]',
-        phone: '[redacted]',
-      })
-    }
-
-    setStatus('loading')
-    try {
-      const res = await fetch('/api/lead', {
-        method: 'POST',
-        headers: getLeadFetchHeaders(),
-        body: JSON.stringify(payload),
-        cache: 'no-store',
-        credentials: 'same-origin',
-      })
-
-      let body = null
-      const raw = await res.text()
-      if (raw) {
-        try {
-          body = JSON.parse(raw)
-        } catch {
-          body = null
-        }
-      }
-
-      if (!res.ok) {
-        setStatus('idle')
-        setErrorMsg(parseApiError(body, res.status))
-        if (process.env.NODE_ENV === 'development') {
-          console.debug('[LeadForm] API error', res.status, body)
-        }
-        return
-      }
-
-      setData(initialForm)
-      setStep(1)
-      setStatus('success')
-    } catch (err) {
-      setStatus('idle')
-      setErrorMsg(`Network error. Please try again or call ${PHONE_PRIMARY}.`)
-      if (process.env.NODE_ENV === 'development') {
-        console.debug('[LeadForm] network error', err)
-      }
-    }
+    timeoutSentRef.current = true
+    await submitToApi(pendingPayloadRef.current, {
+      appointmentSkipped: false,
+      appointmentAt: selectedSlotMs,
+    })
   }
 
   const motionDur = prefersReducedMotion ? 0 : 0.35
-
-  if (status === 'success') {
-    return (
-      <div className="relative rounded-2xl border border-stone-200 bg-white/95 p-6 shadow-2xl backdrop-blur-md sm:p-8">
-        <div className="animate-form-success flex min-h-[280px] flex-col items-center justify-center text-center">
-          <SuccessMarks />
-          <h3 className="mt-6 text-xl font-bold text-stone-900">Request Received!</h3>
-          <p className="mt-2 max-w-sm text-stone-600">
-            Our team will reach out shortly. For urgent needs, call{' '}
-            <a
-              href={PHONE_PRIMARY_HREF}
-              className="font-semibold text-stone-900 underline decoration-amber-600 underline-offset-2"
-            >
-              {PHONE_PRIMARY}
-            </a>
-            .
-          </p>
-          <button
-            type="button"
-            onClick={() => setStatus('idle')}
-            className="mt-8 min-h-12 rounded-xl border-2 border-stone-200 px-6 text-sm font-bold text-stone-900 transition-all duration-300 ease-in-out hover:border-amber-600 hover:bg-amber-50"
-          >
-            Submit another request
-          </button>
-        </div>
-      </div>
-    )
-  }
 
   return (
     <div
@@ -351,10 +371,12 @@ export function LeadForm() {
     >
       <div className="mb-4 text-center">
         <h3 className="text-lg font-bold text-stone-900 sm:text-xl">Free Impact Assessment</h3>
-        <p className="mt-1 text-xs text-stone-500 sm:text-sm">Three quick steps — zero obligation.</p>
+        <p className="mt-1 text-xs text-stone-500 sm:text-sm">
+          {step < 4 ? 'Three quick steps — then pick your visit time.' : 'Choose a time (Eastern Time)'}
+        </p>
       </div>
 
-      <ProgressBar step={step} />
+      <ProgressBar step={step} total={STEPS.length} />
 
       <div
         className="mb-4 flex items-center justify-center gap-2"
@@ -425,7 +447,7 @@ export function LeadForm() {
           )}
 
           {step === 3 && (
-            <form onSubmit={submit} className="space-y-3">
+            <form onSubmit={continueToCalendar} className="space-y-3">
               <label className="sr-only" aria-hidden>
                 Website
                 <input
@@ -487,21 +509,9 @@ export function LeadForm() {
                 <input
                   required
                   autoComplete="street-address"
-                  placeholder="Street address"
+                  placeholder="Street, city, state"
                   value={data.address}
                   onChange={(e) => setData({ ...data, address: sanitizeInput(e.target.value) })}
-                  className={fieldClass}
-                />
-              </IconField>
-
-              <IconField icon={Hash} label="Zip Code">
-                <input
-                  required
-                  autoComplete="postal-code"
-                  inputMode="numeric"
-                  placeholder="e.g. 33020"
-                  value={data.zip}
-                  onChange={(e) => setData({ ...data, zip: sanitizeInput(e.target.value) })}
                   className={fieldClass}
                 />
               </IconField>
@@ -548,33 +558,70 @@ export function LeadForm() {
               )}
               <button
                 type="submit"
-                disabled={status === 'loading'}
+                className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-600 to-yellow-500 text-sm font-bold text-white shadow-lg transition-all duration-300 ease-in-out hover:shadow-amber-500/20"
+              >
+                <Calendar className="h-4 w-4" aria-hidden />
+                Continue to Schedule
+              </button>
+            </form>
+          )}
+
+          {step === 4 && (
+            <div className="space-y-4">
+              {timeoutSecs !== null && timeoutSecs > 0 && (
+                <p className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-center text-xs text-stone-500">
+                  Select a time within{' '}
+                  <strong className="text-stone-700">
+                    {Math.floor(timeoutSecs / 60)}:{String(timeoutSecs % 60).padStart(2, '0')}
+                  </strong>{' '}
+                  or we&apos;ll save your details and follow up by phone.
+                </p>
+              )}
+
+              <AppointmentCalendar
+                selectedMs={selectedSlotMs}
+                onSelect={(ms) => {
+                  setSelectedSlotMs(ms)
+                  setErrorMsg('')
+                }}
+              />
+
+              {errorMsg && (
+                <p className="text-sm text-red-600" role="alert">
+                  {errorMsg}
+                </p>
+              )}
+
+              <button
+                type="button"
+                onClick={confirmAppointment}
+                disabled={status === 'loading' || !selectedSlotMs}
                 className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-600 to-yellow-500 text-sm font-bold text-white shadow-lg transition-all duration-300 ease-in-out hover:shadow-amber-500/20 disabled:opacity-70"
               >
                 {status === 'loading' ? (
                   <>
                     <Loader2 className="h-5 w-5 animate-spin" aria-hidden />
-                    Sending...
+                    Confirming…
                   </>
                 ) : (
                   <>
-                    <Send className="h-4 w-4" aria-hidden />
-                    Submit Free Quote Request
+                    <CheckCircle2 className="h-4 w-4" aria-hidden />
+                    Confirm Appointment
                   </>
                 )}
               </button>
-            </form>
+            </div>
           )}
         </motion.div>
       </AnimatePresence>
 
-      {errorMsg && step !== 3 && (
+      {errorMsg && step !== 3 && step !== 4 && (
         <p className="mt-3 text-sm text-red-600" role="alert">
           {errorMsg}
         </p>
       )}
 
-      {step > 1 && (
+      {step > 1 && step < 4 && (
         <div className="mt-4 border-t border-stone-200 pt-4">
           <button
             type="button"
@@ -585,6 +632,23 @@ export function LeadForm() {
             className="flex min-h-12 items-center text-sm font-semibold text-stone-500 transition-colors duration-300 hover:text-stone-900"
           >
             ← Back
+          </button>
+        </div>
+      )}
+
+      {step === 4 && (
+        <div className="mt-4 border-t border-stone-200 pt-4">
+          <button
+            type="button"
+            onClick={() => {
+              setErrorMsg('')
+              setStep(3)
+              calendarStartedAtRef.current = null
+              timeoutSentRef.current = false
+            }}
+            className="flex min-h-12 items-center text-sm font-semibold text-stone-500 transition-colors duration-300 hover:text-stone-900"
+          >
+            ← Back to contact details
           </button>
         </div>
       )}

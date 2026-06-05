@@ -1,18 +1,16 @@
 import { SERVICES, TIMELINES } from '@/lib/formOptions'
+import { slotWithinRules } from '@/lib/scheduling'
 
 const MAX = {
   name: 120,
   email: 254,
   phone: 32,
   address: 200,
-  zip: 16,
   meta: 512,
 } as const
 
 const CONTROL_CHARS = /[\u0000-\u001F\u007F]/g
 const HTML_TAG = /<[^>]*>/g
-const ZIP_PATTERN = /^\d{5}(-\d{4})?$/
-
 export type LeadFormData = {
   service: string
   timeline: string
@@ -20,9 +18,10 @@ export type LeadFormData = {
   email: string
   phone: string
   address: string
-  zip: string
   marketingSmsConsent: boolean
   informationalSmsConsent: boolean
+  appointmentAt: string | null
+  appointmentSkipped: boolean
 }
 
 export function sanitizeText(value: unknown, maxLen: number): string {
@@ -70,7 +69,8 @@ export function validateLeadBody(body: unknown):
     return { ok: false, error: 'Invalid submission' }
   }
 
-  if (!validateSubmissionTiming(raw.formLoadedAt)) {
+  const skipTimingCheck = raw.skipTimingCheck === true
+  if (!skipTimingCheck && !validateSubmissionTiming(raw.formLoadedAt)) {
     return { ok: false, error: 'Invalid submission' }
   }
 
@@ -80,12 +80,11 @@ export function validateLeadBody(body: unknown):
   const email = sanitizeText(raw.email, MAX.email).toLowerCase()
   const phone = sanitizeText(raw.phone, MAX.phone)
   const address = sanitizeText(raw.address, MAX.address)
-  const zip = sanitizeText(raw.zip, MAX.zip)
 
   const marketingSmsConsent = raw.marketingSmsConsent === true
   const informationalSmsConsent = raw.informationalSmsConsent === true
 
-  if (!service || !timeline || !name || !email || !phone || !address || !zip) {
+  if (!service || !timeline || !name || !email || !phone || !address) {
     return { ok: false, error: 'Missing required fields' }
   }
 
@@ -118,8 +117,19 @@ export function validateLeadBody(body: unknown):
     return { ok: false, error: 'Please enter a valid property address' }
   }
 
-  if (!ZIP_PATTERN.test(zip)) {
-    return { ok: false, error: 'Please enter a valid ZIP code' }
+  const appointmentSkipped = raw.appointmentSkipped === true
+  const appointmentRaw = sanitizeText(raw.appointmentAt ?? raw.appointment, 64)
+  let appointmentAt: string | null = null
+
+  if (!appointmentSkipped) {
+    if (!appointmentRaw) {
+      return { ok: false, error: 'Please select an appointment time' }
+    }
+    const slotMs = Date.parse(appointmentRaw)
+    if (!Number.isFinite(slotMs) || !slotWithinRules(slotMs)) {
+      return { ok: false, error: 'Invalid appointment time' }
+    }
+    appointmentAt = new Date(slotMs).toISOString()
   }
 
   return {
@@ -131,9 +141,10 @@ export function validateLeadBody(body: unknown):
       email,
       phone,
       address,
-      zip,
       marketingSmsConsent,
       informationalSmsConsent,
+      appointmentAt,
+      appointmentSkipped,
     },
   }
 }

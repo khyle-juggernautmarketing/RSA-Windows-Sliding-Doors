@@ -24,7 +24,7 @@ export default function PrivacyPage() {
           <h2 className="text-xl font-bold text-stone-900">Information we collect</h2>
           <p>
             When you request a quote, we may collect your name, email, phone number, property
-            address, ZIP code, service preferences, timeline information, and SMS consent choices
+            address, service preferences, timeline information, and SMS consent choices
             you provide voluntarily.
           </p>
           <h2 className="text-xl font-bold text-stone-900">SMS communications</h2>

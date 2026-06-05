@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { PHONE_PRIMARY } from '@/lib/constants'
+import { reserveSlot } from '@/lib/bookingStore'
 import {
   isValidLeadRequestHeader,
   rateLimitKey,
@@ -8,14 +9,12 @@ import {
   validateLeadBody,
 } from '@/lib/leadSecurity'
 import { isAllowedLeadRequest, isSameOriginRequest } from '@/lib/requestSecurity'
-import { isValidBearerSecret, isValidWebhookUrl } from '@/lib/webhook'
+import { getWebhookConfig, postToWebhookWithRetry } from '@/lib/webhook'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-const WEBHOOK_TIMEOUT_MS = 20_000
-const WEBHOOK_MAX_ATTEMPTS = 3
-const MAX_BODY_BYTES = 8_192
+const MAX_BODY_BYTES = 12_288
 
 const JSON_HEADERS = {
   'Content-Type': 'application/json',
@@ -24,65 +23,6 @@ const JSON_HEADERS = {
   'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
   'Permissions-Policy': 'interest-cohort=()',
-}
-
-function getWebhookConfig() {
-  const url = process.env.N8N_WEBHOOK_URL?.trim()
-  const bearer = process.env.N8N_AUTH_BEARER?.trim()
-  if (!url || !bearer) return null
-  if (!isValidWebhookUrl(url) || !isValidBearerSecret(bearer)) return null
-  return { url, bearer }
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-async function postToWebhook(url: string, bearer: string, payload: Record<string, unknown>) {
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS)
-
-  try {
-    return await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        Authorization: `Bearer ${bearer}`,
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-      cache: 'no-store',
-    })
-  } finally {
-    clearTimeout(timeout)
-  }
-}
-
-async function postToWebhookWithRetry(url: string, bearer: string, payload: Record<string, unknown>) {
-  let lastResponse: Response | null = null
-  let lastError: unknown = null
-
-  for (let attempt = 1; attempt <= WEBHOOK_MAX_ATTEMPTS; attempt++) {
-    try {
-      const res = await postToWebhook(url, bearer, payload)
-      if (res.status >= 200 && res.status < 300) return res
-
-      lastResponse = res
-      if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
-        return res
-      }
-    } catch (error) {
-      lastError = error
-    }
-
-    if (attempt < WEBHOOK_MAX_ATTEMPTS) {
-      await sleep(350 * attempt)
-    }
-  }
-
-  if (lastResponse) return lastResponse
-  throw lastError ?? new Error('Webhook unreachable')
 }
 
 export async function GET() {
@@ -98,10 +38,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403, headers: JSON_HEADERS })
   }
 
-  if (request.method !== 'POST') {
-    return NextResponse.json({ error: 'Method not allowed' }, { status: 405, headers: JSON_HEADERS })
-  }
-
   const config = getWebhookConfig()
   if (!config) {
     console.error('Lead API: invalid or missing webhook configuration')
@@ -114,11 +50,6 @@ export async function POST(request: Request) {
   const contentType = request.headers.get('content-type') ?? ''
   if (!contentType.includes('application/json')) {
     return NextResponse.json({ error: 'Unsupported content type' }, { status: 415, headers: JSON_HEADERS })
-  }
-
-  const contentLength = Number(request.headers.get('content-length') ?? 0)
-  if (contentLength > MAX_BODY_BYTES) {
-    return NextResponse.json({ error: 'Request too large' }, { status: 413, headers: JSON_HEADERS })
   }
 
   const limiterKey = rateLimitKey(request)
@@ -154,10 +85,19 @@ export async function POST(request: Request) {
       email,
       phone,
       address,
-      zip,
       marketingSmsConsent,
       informationalSmsConsent,
+      appointmentAt,
+      appointmentSkipped,
     } = validated.data
+
+    if (appointmentAt && !appointmentSkipped) {
+      const slotMs = Date.parse(appointmentAt)
+      const reserved = reserveSlot(slotMs)
+      if (!reserved.ok) {
+        return NextResponse.json({ error: reserved.error }, { status: 409, headers: JSON_HEADERS })
+      }
+    }
 
     const payload = {
       service,
@@ -167,9 +107,12 @@ export async function POST(request: Request) {
       email,
       phone,
       address,
-      zip,
       marketingSmsConsent,
       informationalSmsConsent,
+      appointmentAt,
+      appointmentSkipped,
+      hasAppointment: !appointmentSkipped && !!appointmentAt,
+      timezone: 'America/New_York',
       source: 'rsa-windows-landing',
       submittedAt: new Date().toISOString(),
       referer: sanitizeRequestMeta(request.headers.get('referer')),
@@ -178,7 +121,7 @@ export async function POST(request: Request) {
 
     let res: Response
     try {
-      res = await postToWebhookWithRetry(config.url, config.bearer, payload)
+      res = await postToWebhookWithRetry(config.url, config.jwtSecret, payload)
     } catch (e) {
       const aborted = e instanceof Error && e.name === 'AbortError'
       console.error('Lead API: webhook unreachable', aborted ? 'timeout' : 'network')
@@ -193,7 +136,10 @@ export async function POST(request: Request) {
     }
 
     if (res.status >= 200 && res.status < 300) {
-      return NextResponse.json({ ok: true }, { headers: JSON_HEADERS })
+      return NextResponse.json(
+        { ok: true, appointmentAt, appointmentSkipped },
+        { headers: JSON_HEADERS },
+      )
     }
 
     const errBody = await res.text().catch(() => '')
@@ -203,7 +149,7 @@ export async function POST(request: Request) {
       {
         error:
           res.status === 401 || res.status === 403
-            ? `Form authentication failed on the server. Please call ${PHONE_PRIMARY}.`
+            ? `Our booking system could not accept your request. Please call ${PHONE_PRIMARY}.`
             : `Our booking system could not process your request. Please call ${PHONE_PRIMARY}.`,
       },
       { status: 502, headers: JSON_HEADERS },
